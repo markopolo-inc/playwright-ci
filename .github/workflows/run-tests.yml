@@ -1,0 +1,227 @@
+name: Test Suite
+
+on:
+  schedule:
+    - cron: '0 3 * * *'      # 3 AM UTC daily (full suite)
+    - cron: '0 9 * * 1-5'    # 9 AM UTC weekdays (canary)
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'pytest path/filter — e.g. tests/test_canary.py or -k login'
+        required: false
+        default: ''
+      canary_only:
+        description: 'Run canary (fast, ~2 min) instead of full suite'
+        type: boolean
+        default: false
+
+concurrency:
+  group: test-suite
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  run-tests:
+    name: Playwright Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      # ── 1. Mask all secret values immediately ─────────────────────────────
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ secrets.REPO_SLUG }}"
+          echo "::add-mask::${{ secrets.EMAIL_TEST_EMAIL }}"
+          echo "::add-mask::${{ secrets.EMAIL_TEST_PASSWORD }}"
+          echo "::add-mask::${{ secrets.WOO_TEST_EMAIL }}"
+          echo "::add-mask::${{ secrets.WOO_TEST_PASSWORD }}"
+
+      # ── 2. Add deploy key to SSH agent, clone, then immediately remove key ─
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Clone source
+        run: |
+          git clone --quiet --depth=1 "git@github.com:${{ secrets.REPO_SLUG }}.git" src
+          echo "Source ready"
+
+      - name: Remove SSH key from agent
+        if: always()
+        run: ssh-add -D 2>/dev/null || true
+
+      # ── 3. Python + dependencies ──────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: src/requirements.txt
+
+      - name: Install Python dependencies
+        working-directory: src
+        run: pip install -q -r requirements.txt pytest-json-report pytest-xdist
+
+      - name: Install Playwright browsers
+        working-directory: src
+        run: python -m playwright install chromium --with-deps --quiet
+
+      # ── 4. Canary (fast gate — always runs first) ─────────────────────────
+      - name: Canary smoke tests
+        id: canary
+        working-directory: src
+        env:
+          EMAIL_TEST_EMAIL: ${{ secrets.EMAIL_TEST_EMAIL }}
+          EMAIL_TEST_PASSWORD: ${{ secrets.EMAIL_TEST_PASSWORD }}
+          WOO_TEST_EMAIL: ${{ secrets.WOO_TEST_EMAIL }}
+          WOO_TEST_PASSWORD: ${{ secrets.WOO_TEST_PASSWORD }}
+          HEADLESS: 'true'
+          BASE_URL: 'https://app-stg.markopolo.ai'
+        run: |
+          python -m pytest tests/test_canary.py -m smoke \
+            --tb=short -q \
+            --json-report --json-report-file=canary_report.json \
+            -o "addopts=" \
+            2>&1 | tail -20
+        continue-on-error: true
+
+      # ── 5. Full suite (skipped on weekday 9AM runs or canary_only=true) ───
+      - name: Full test suite
+        id: full_suite
+        if: |
+          github.event_name != 'schedule' ||
+          github.event.schedule == '0 3 * * *'
+        working-directory: src
+        env:
+          EMAIL_TEST_EMAIL: ${{ secrets.EMAIL_TEST_EMAIL }}
+          EMAIL_TEST_PASSWORD: ${{ secrets.EMAIL_TEST_PASSWORD }}
+          WOO_TEST_EMAIL: ${{ secrets.WOO_TEST_EMAIL }}
+          WOO_TEST_PASSWORD: ${{ secrets.WOO_TEST_PASSWORD }}
+          HEADLESS: 'true'
+          BASE_URL: 'https://app-stg.markopolo.ai'
+        run: |
+          FILTER="${{ github.event.inputs.filter }}"
+          if [ "${{ github.event.inputs.canary_only }}" = "true" ]; then
+            echo "Canary-only run — skipping full suite"
+            exit 0
+          fi
+          python -m pytest ${FILTER:-tests/} \
+            --ignore=tests/advanced_types \
+            --tb=short -q \
+            -n auto \
+            --json-report --json-report-file=full_report.json \
+            --html=report.html --self-contained-html \
+            -o "addopts=" \
+            2>&1 | tail -60
+        continue-on-error: true
+
+      # ── 6. Convert reports → automation_status JSON ───────────────────────
+      - name: Generate status JSON
+        working-directory: src
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          for report_file, out_file in [
+              ("canary_report.json",  "automation_status_canary.json"),
+              ("full_report.json",    "automation_status_stg.json"),
+          ]:
+              if not os.path.exists(report_file):
+                  continue
+
+              with open(report_file) as f:
+                  report = json.load(f)
+
+              summary = report.get("summary", {})
+              status = {
+                  "_run_at":  report.get("created", ""),
+                  "_total":   summary.get("total", 0),
+                  "_passed":  summary.get("passed", 0),
+                  "_failed":  summary.get("failed", 0),
+                  "_skipped": summary.get("skipped", 0),
+              }
+
+              for test in report.get("tests", []):
+                  outcome = test.get("outcome", "")
+                  node_id = test.get("nodeid", "")
+                  if outcome == "passed":
+                      status[node_id] = "Pass"
+                  elif outcome in ("failed", "error"):
+                      status[node_id] = "Fail"
+                  elif outcome == "skipped":
+                      status[node_id] = "Skip"
+
+              with open(out_file, "w") as f:
+                  json.dump(status, f, indent=2)
+
+              total   = summary.get("total", 0)
+              passed  = summary.get("passed", 0)
+              failed  = summary.get("failed", 0)
+              pct     = round(passed / total * 100, 1) if total else 0
+              print(f"{out_file}: {passed}/{total} passed ({pct}%), {failed} failed")
+          PYEOF
+
+      # ── 7. Publish status JSON to this repo's gh-pages ───────────────────
+      - name: Publish results to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        if: always()
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: src
+          publish_branch: gh-pages
+          include_files: |
+            automation_status_stg.json
+            automation_status_canary.json
+            report.html
+          keep_files: true
+          commit_message: "ci: update test results [run #${{ github.run_number }}]"
+
+      # ── 8. Upload artifacts (report HTML + JSON, 30 day retention) ────────
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-run-${{ github.run_number }}
+          path: |
+            src/report.html
+            src/full_report.json
+            src/canary_report.json
+          retention-days: 30
+
+      # ── 9. Job summary ────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        working-directory: src
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+
+          lines = ["## Test Results\n"]
+
+          for label, fname in [("Canary", "canary_report.json"), ("Full Suite", "full_report.json")]:
+              if not os.path.exists(fname):
+                  continue
+              with open(fname) as f:
+                  r = json.load(f)
+              s = r.get("summary", {})
+              total   = s.get("total",   0)
+              passed  = s.get("passed",  0)
+              failed  = s.get("failed",  0)
+              skipped = s.get("skipped", 0)
+              pct     = round(passed / total * 100, 1) if total else 0
+              lines.append(f"### {label}")
+              lines.append(f"| | |")
+              lines.append(f"|---|---|")
+              lines.append(f"| Total | {total} |")
+              lines.append(f"| ✅ Pass | {passed} ({pct}%) |")
+              lines.append(f"| ❌ Fail | {failed} |")
+              lines.append(f"| ⏭ Skip | {skipped} |")
+              lines.append("")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          with open(summary_path, "a") as f:
+              f.write("\n".join(lines))
+          PYEOF
