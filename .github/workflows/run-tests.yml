@@ -13,17 +13,22 @@ on:
         default: false
 
 concurrency:
-  group: test-suite
-  cancel-in-progress: true
+  group: test-suite-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   PYTHON_VERSION: '3.11'
 
 jobs:
   run-tests:
-    name: Playwright Tests
+    name: ${{ matrix.env == 'stg' && '🟡 STG' || '🟢 MAIN' }} tests
     runs-on: ubuntu-latest
     timeout-minutes: 240
+
+    strategy:
+      matrix:
+        env: [stg, main]
+      fail-fast: false   # both envs run to completion even if one fails
 
     steps:
       # ── 1. Mask all secret values immediately ─────────────────────────────
@@ -68,7 +73,7 @@ jobs:
         working-directory: src
         run: python -m playwright install chromium --with-deps
 
-      # ── 4. Canary (fast gate — always runs first) ─────────────────────────
+      # ── 4. Canary (fast gate) ─────────────────────────────────────────────
       - name: Canary smoke tests
         id: canary
         working-directory: src
@@ -78,7 +83,7 @@ jobs:
           WOO_TEST_EMAIL: ${{ secrets.WOO_TEST_EMAIL }}
           WOO_TEST_PASSWORD: ${{ secrets.WOO_TEST_PASSWORD }}
           HEADLESS: 'true'
-          BASE_URL: 'https://app-stg.markopolo.ai'
+          BASE_URL: ${{ matrix.env == 'stg' && 'https://app-stg.markopolo.ai' || 'https://app.markopolo.ai' }}
         run: |
           python -m pytest tests/test_canary.py -m smoke \
             --tb=short -q \
@@ -87,7 +92,7 @@ jobs:
             2>&1 | tail -30
         continue-on-error: true
 
-      # ── 5. Full suite (only on 9 PM schedule or manual without canary_only) ─
+      # ── 5. Full suite ──────────────────────────────────────────────────────
       - name: Full test suite
         id: full_suite
         if: github.event.inputs.canary_only != 'true'
@@ -98,7 +103,8 @@ jobs:
           WOO_TEST_EMAIL: ${{ secrets.WOO_TEST_EMAIL }}
           WOO_TEST_PASSWORD: ${{ secrets.WOO_TEST_PASSWORD }}
           HEADLESS: 'true'
-          BASE_URL: 'https://app-stg.markopolo.ai'
+          BASE_URL: ${{ matrix.env == 'stg' && 'https://app-stg.markopolo.ai' || 'https://app.markopolo.ai' }}
+          MARKOPOLO_URL: ${{ matrix.env == 'stg' && 'https://app-stg.markopolo.ai' || 'https://app.markopolo.ai' }}
         run: |
           FILTER="${{ github.event.inputs.filter }}"
           python -m pytest ${FILTER:-tests/} \
@@ -111,17 +117,22 @@ jobs:
             2>&1 | tail -60
         continue-on-error: true
 
-      # ── 6. Convert reports → automation_status JSON ───────────────────────
+      # ── 6. Convert reports → automation_status JSON + report.json ─────────
       - name: Generate status JSON
         if: always()
         working-directory: src
+        env:
+          RUN_ENV: ${{ matrix.env }}
         run: |
           python3 - <<'PYEOF'
-          import json, os
+          import json, os, shutil
 
+          run_env = os.environ.get("RUN_ENV", "stg")
+
+          # canary: always stg-labeled (backward compat)
           for report_file, out_file in [
-              ("canary_report.json",  "automation_status_canary.json"),
-              ("full_report.json",    "automation_status_stg.json"),
+              ("canary_report.json",  f"automation_status_canary_{run_env}.json"),
+              ("full_report.json",    f"automation_status_{run_env}.json"),
           ]:
               if not os.path.exists(report_file):
                   print(f"Skipped {report_file} — not found")
@@ -157,22 +168,37 @@ jobs:
               failed = summary.get("failed", 0)
               pct    = round(passed / total * 100, 1) if total else 0
               print(f"{out_file}: {passed}/{total} passed ({pct}%), {failed} failed")
+
+          # Also copy full_report.json → {env}/report.json for the report page
+          if os.path.exists("full_report.json"):
+              os.makedirs(run_env, exist_ok=True)
+              shutil.copy("full_report.json", f"{run_env}/report.json")
+              print(f"Copied full_report.json → {run_env}/report.json")
+
+          # Backward compat: stg canary → automation_status_canary.json
+          if run_env == "stg" and os.path.exists("automation_status_canary_stg.json"):
+              shutil.copy("automation_status_canary_stg.json", "automation_status_canary.json")
+              print("Copied canary stg → automation_status_canary.json (backward compat)")
           PYEOF
 
-      # ── 7. Copy ONLY results files to a clean publish dir ─────────────────
-      #    NEVER publish src/ — it contains the private repo clone
-      # Only copy status JSONs — never report.html (it may contain account details in failure msgs)
+      # ── 7. Prepare publish dir (only results — NEVER src/) ────────────────
       - name: Prepare results for publish
         if: always()
+        env:
+          RUN_ENV: ${{ matrix.env }}
         run: |
-          mkdir -p publish
+          mkdir -p publish/${RUN_ENV}
+          # Root-level status JSONs (fetched by testcases.html)
           for f in \
-            src/automation_status_stg.json \
+            src/automation_status_${RUN_ENV}.json \
+            src/automation_status_canary_${RUN_ENV}.json \
             src/automation_status_canary.json; do
-            [ -f "$f" ] && cp "$f" publish/ && echo "Included: $f" || echo "Missing: $f"
+            [ -f "$f" ] && cp "$f" publish/ && echo "Included: $f" || true
           done
+          # Per-env report.json (fetched by stg/index.html or main/index.html)
+          [ -f "src/${RUN_ENV}/report.json" ] && cp "src/${RUN_ENV}/report.json" "publish/${RUN_ENV}/report.json" && echo "Included: ${RUN_ENV}/report.json" || echo "Missing: ${RUN_ENV}/report.json"
 
-      # ── 8. Publish ONLY results dir to gh-pages (not the private repo clone)─
+      # ── 8. Publish results to gh-pages ────────────────────────────────────
       - name: Publish results to gh-pages
         if: always()
         uses: peaceiris/actions-gh-pages@v4
@@ -181,15 +207,14 @@ jobs:
           publish_dir: publish
           publish_branch: gh-pages
           keep_files: true
-          commit_message: "ci: update results [run #${{ github.run_number }}]"
+          commit_message: "ci: update ${{ matrix.env }} results [run #${{ github.run_number }}]"
 
       # ── 9. Upload artifacts ───────────────────────────────────────────────
-      # Artifacts require GitHub login — safe to include detailed report.html here
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: results-run-${{ github.run_number }}
+          name: results-${{ matrix.env }}-run-${{ github.run_number }}
           path: |
             publish/
             src/report.html
@@ -199,17 +224,19 @@ jobs:
       # ── 10. Job summary ───────────────────────────────────────────────────
       - name: Write job summary
         if: always()
+        env:
+          RUN_ENV: ${{ matrix.env }}
         run: |
           python3 - <<'PYEOF'
           import json, os
 
-          lines = ["## Test Results\n"]
-          any_report = False
+          run_env = os.environ.get("RUN_ENV", "stg")
+          env_label = "STG" if run_env == "stg" else "MAIN"
+          lines = [f"## Test Results — {env_label}\n"]
 
           for label, fname in [("Canary", "src/canary_report.json"), ("Full Suite", "src/full_report.json")]:
               if not os.path.exists(fname):
                   continue
-              any_report = True
               with open(fname) as f:
                   r = json.load(f)
               s = r.get("summary", {})
@@ -228,7 +255,7 @@ jobs:
               lines.append(f"| Skip   | {skipped} |")
               lines.append("")
 
-          if not any_report:
+          if len(lines) == 1:
               lines.append("_No test reports generated — check earlier steps for errors._")
 
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
