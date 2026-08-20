@@ -1,8 +1,8 @@
 {
-  "_run_at": 1787209769.545759,
+  "_run_at": 1787212362.0232387,
   "_total": 19,
-  "_passed": 14,
-  "_failed": 5,
+  "_passed": 16,
+  "_failed": 3,
   "_skipped": 0,
   "tests/test_canary.py::TestCanaryLoginPage::test_login_page_loads[chromium]": "Fail",
   "tests/test_canary.py::TestCanaryLoginPage::test_login_page_has_required_inputs[chromium]": "Pass",
@@ -12,15 +12,15 @@
   "tests/test_canary.py::TestCanaryDashboard::test_login_succeeds[chromium]": "Pass",
   "tests/test_canary.py::TestCanaryDashboard::test_dashboard_loads_after_login[chromium]": "Pass",
   "tests/test_canary.py::TestCanaryDashboard::test_no_undefined_nan_on_dashboard[chromium]": "Pass",
-  "tests/test_canary.py::TestCanaryDashboard::test_dashboard_page_title_contains_markopolo[chromium]": "Pass",
+  "tests/test_canary.py::TestCanaryDashboard::test_dashboard_page_title_contains_markopolo[chromium]": "Fail",
   "tests/test_canary.py::TestCanaryDashboard::test_api_no_5xx_on_dashboard_load[chromium]": "Pass",
   "tests/test_canary.py::TestCanaryDashboard::test_api_no_401_on_authenticated_routes[chromium]": "Pass",
   "tests/test_canary.py::TestCanaryDashboard::test_no_broken_images_on_dashboard[chromium]": "Pass",
-  "tests/test_canary.py::TestCanaryAccountState::test_post_login_ui_renders[chromium]": "Fail",
+  "tests/test_canary.py::TestCanaryAccountState::test_post_login_ui_renders[chromium]": "Pass",
   "tests/test_canary.py::TestCanaryAccountState::test_settings_page_accessible[chromium]": "Pass",
-  "tests/test_canary.py::TestCanaryAccountState::test_campaigns_url_does_not_404[chromium]": "Fail",
+  "tests/test_canary.py::TestCanaryAccountState::test_campaigns_url_does_not_404[chromium]": "Pass",
   "tests/test_canary.py::TestCanaySidebar::test_sidebar_structure_present[chromium]": "Pass",
   "tests/test_canary.py::TestCanaySidebar::test_locked_sidebar_items_are_buttons[chromium]": "Fail",
   "tests/test_canary.py::TestCanaySidebar::test_settings_sidebar_link_is_anchor[chromium]": "Pass",
-  "tests/test_canary.py::TestCanarySettings::test_settings_business_name_field_editable[chromium]": "Fail"
+  "tests/test_canary.py::TestCanarySettings::test_settings_business_name_field_editable[chromium]": "Pass"
 }
