@@ -2,8 +2,8 @@ name: Test Suite
 
 on:
   schedule:
-    - cron: '0 3 * * *'      # 3 AM UTC daily (full suite)
-    - cron: '0 9 * * 1-5'    # 9 AM UTC weekdays (canary)
+    - cron: '0 15 * * *'     # 9 PM Bangladesh (BST=UTC+6) daily → full suite runs overnight
+    - cron: '0 2 * * *'      # 8 AM Bangladesh daily → quick canary health check
   workflow_dispatch:
     inputs:
       filter:
@@ -93,7 +93,7 @@ jobs:
         id: full_suite
         if: |
           github.event_name != 'schedule' ||
-          github.event.schedule == '0 3 * * *'
+          github.event.schedule == '0 15 * * *'
         working-directory: src
         env:
           EMAIL_TEST_EMAIL: ${{ secrets.EMAIL_TEST_EMAIL }}
