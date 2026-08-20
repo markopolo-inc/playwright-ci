@@ -1,9 +1,6 @@
 name: Test Suite
 
 on:
-  schedule:
-    - cron: '0 15 * * *'     # 9 PM Bangladesh (BST=UTC+6) daily → full suite runs overnight
-    - cron: '0 2 * * *'      # 8 AM Bangladesh daily → quick canary health check
   workflow_dispatch:
     inputs:
       filter:
@@ -93,9 +90,7 @@ jobs:
       # ── 5. Full suite (only on 9 PM schedule or manual without canary_only) ─
       - name: Full test suite
         id: full_suite
-        if: |
-          (github.event_name == 'schedule' && github.event.schedule == '0 15 * * *') ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.canary_only != 'true')
+        if: github.event.inputs.canary_only != 'true'
         working-directory: src
         env:
           EMAIL_TEST_EMAIL: ${{ secrets.EMAIL_TEST_EMAIL }}
@@ -166,14 +161,14 @@ jobs:
 
       # ── 7. Copy ONLY results files to a clean publish dir ─────────────────
       #    NEVER publish src/ — it contains the private repo clone
+      # Only copy status JSONs — never report.html (it may contain account details in failure msgs)
       - name: Prepare results for publish
         if: always()
         run: |
           mkdir -p publish
           for f in \
             src/automation_status_stg.json \
-            src/automation_status_canary.json \
-            src/report.html; do
+            src/automation_status_canary.json; do
             [ -f "$f" ] && cp "$f" publish/ && echo "Included: $f" || echo "Missing: $f"
           done
 
@@ -189,12 +184,15 @@ jobs:
           commit_message: "ci: update results [run #${{ github.run_number }}]"
 
       # ── 9. Upload artifacts ───────────────────────────────────────────────
+      # Artifacts require GitHub login — safe to include detailed report.html here
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: results-run-${{ github.run_number }}
-          path: publish/
+          path: |
+            publish/
+            src/report.html
           if-no-files-found: warn
           retention-days: 30
 

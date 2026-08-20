@@ -1,5 +1,7 @@
 # CI Runner
 
-Automated test runner. Runs on a schedule.
+Manual-trigger test runner. No automatic schedule.
+
+Trigger from the Actions tab → Run workflow.
 
 No source code in this repository.
