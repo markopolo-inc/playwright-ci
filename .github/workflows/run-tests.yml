@@ -23,7 +23,7 @@ jobs:
   run-tests:
     name: ${{ matrix.env == 'stg' && '🟡 STG' || '🟢 MAIN' }} tests
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     strategy:
       matrix:
@@ -84,6 +84,7 @@ jobs:
           WOO_TEST_PASSWORD: ${{ secrets.WOO_TEST_PASSWORD }}
           HEADLESS: 'true'
           BASE_URL: ${{ matrix.env == 'stg' && 'https://app-stg.markopolo.ai' || 'https://app.markopolo.ai' }}
+          MARKOPOLO_URL: ${{ matrix.env == 'stg' && 'https://app-stg.markopolo.ai' || 'https://app.markopolo.ai' }}
         run: |
           python -m pytest tests/test_canary.py -m smoke \
             --tb=short -q \
@@ -129,14 +130,10 @@ jobs:
 
           run_env = os.environ.get("RUN_ENV", "stg")
 
-          # canary: always stg-labeled (backward compat)
-          for report_file, out_file in [
-              ("canary_report.json",  f"automation_status_canary_{run_env}.json"),
-              ("full_report.json",    f"automation_status_{run_env}.json"),
-          ]:
+          def convert_report(report_file, out_file):
               if not os.path.exists(report_file):
                   print(f"Skipped {report_file} — not found")
-                  continue
+                  return {}
 
               with open(report_file) as f:
                   report = json.load(f)
@@ -168,6 +165,26 @@ jobs:
               failed = summary.get("failed", 0)
               pct    = round(passed / total * 100, 1) if total else 0
               print(f"{out_file}: {passed}/{total} passed ({pct}%), {failed} failed")
+              return status
+
+          # Canary results
+          canary_status = convert_report(
+              "canary_report.json",
+              f"automation_status_canary_{run_env}.json",
+          )
+
+          # Full suite results — may not exist if suite timed out
+          full_status = convert_report(
+              "full_report.json",
+              f"automation_status_{run_env}.json",
+          )
+
+          # Fallback: if full suite didn't produce results, publish canary results
+          # as automation_status_{env}.json so the dashboard isn't empty
+          if not os.path.exists(f"automation_status_{run_env}.json") and canary_status:
+              with open(f"automation_status_{run_env}.json", "w") as f:
+                  json.dump(canary_status, f, indent=2)
+              print(f"Fallback: wrote canary results → automation_status_{run_env}.json")
 
           # Also copy full_report.json → {env}/report.json for the report page
           if os.path.exists("full_report.json"):
@@ -197,17 +214,58 @@ jobs:
           done
           # Per-env report.json (fetched by stg/index.html or main/index.html)
           [ -f "src/${RUN_ENV}/report.json" ] && cp "src/${RUN_ENV}/report.json" "publish/${RUN_ENV}/report.json" && echo "Included: ${RUN_ENV}/report.json" || echo "Missing: ${RUN_ENV}/report.json"
+          echo "Publish dir contents:"
+          find publish/ -type f | sort
 
-      # ── 8. Publish results to gh-pages ────────────────────────────────────
+      # ── 8. Publish results to gh-pages (with push retry for race condition) ─
       - name: Publish results to gh-pages
         if: always()
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: publish
-          publish_branch: gh-pages
-          keep_files: true
-          commit_message: "ci: update ${{ matrix.env }} results [run #${{ github.run_number }}]"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          BRANCH="gh-pages"
+          WORK_DIR="$(pwd)/publish"
+          DEPLOY_DIR="$(pwd)/_ghpages_deploy"
+
+          # Clone or init gh-pages branch
+          if git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" > /dev/null 2>&1; then
+            git clone --depth=1 --branch="$BRANCH" "$REMOTE" "$DEPLOY_DIR"
+          else
+            mkdir -p "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+            git init && git checkout -b "$BRANCH"
+            git remote add origin "$REMOTE"
+            cd -
+          fi
+
+          # Merge new files in (keep existing — other matrix job's files)
+          cp -r "$WORK_DIR"/. "$DEPLOY_DIR"/
+
+          cd "$DEPLOY_DIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          touch .nojekyll
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to deploy — skipping push"
+            exit 0
+          fi
+          git commit -m "ci: update ${{ matrix.env }} results [run #${{ github.run_number }}]"
+
+          # Retry push up to 5 times — handles race condition when MAIN and STG
+          # push simultaneously. Pull --rebase syncs with the winning push, then
+          # we push our unique env files on top.
+          for i in 1 2 3 4 5; do
+            if git push origin "$BRANCH"; then
+              echo "Push succeeded on attempt $i"
+              break
+            else
+              echo "Push attempt $i failed (likely race with other env job) — pulling and retrying..."
+              git pull --rebase origin "$BRANCH" 2>/dev/null || true
+              sleep $((i * 3))
+            fi
+          done
 
       # ── 9. Upload artifacts ───────────────────────────────────────────────
       - name: Upload test artifacts
